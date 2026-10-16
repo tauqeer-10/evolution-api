@@ -1825,7 +1825,9 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      const labelName = label.name.replace(/[^\x20-\x7E]/g, '');
+      // Partial label updates can arrive without a name; fall back to the saved one
+      const labelName = (label.name ?? savedLabel?.name)?.replace(/[^\x20-\x7E]/g, '');
+      if (labelName === undefined) return;
       if (!savedLabel || savedLabel.color !== `${label.color}` || savedLabel.name !== labelName) {
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.LABELS) {
           const labelData = {

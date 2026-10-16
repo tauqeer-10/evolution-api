@@ -299,8 +299,8 @@ export class BusinessStartupService extends ChannelStartupService {
       let result =
         'BEGIN:VCARD\n' +
         'VERSION:3.0\n' +
-        `N:${contact.name.formatted_name}\n` +
-        `FN:${contact.name.formatted_name}\n`;
+        `N:${contact.name?.formatted_name ?? ''}\n` +
+        `FN:${contact.name?.formatted_name ?? ''}\n`;
 
       if (contact.org) {
         result += `ORG:${contact.org.company};\n`;
@@ -314,29 +314,30 @@ export class BusinessStartupService extends ChannelStartupService {
         result += `URL:${contact.urls[0].url}\n`;
       }
 
-      if (!contact.phones[0]?.wa_id) {
-        contact.phones[0].wa_id = createJid(contact.phones[0].phone);
+      const phone = contact.phones?.[0];
+      if (phone) {
+        if (!phone.wa_id) {
+          phone.wa_id = createJid(phone.phone);
+        }
+        result += `item1.TEL;waid=${phone.wa_id}:${phone.phone}\n` + 'item1.X-ABLabel:Celular\n';
       }
 
-      result +=
-        `item1.TEL;waid=${contact.phones[0]?.wa_id}:${contact.phones[0].phone}\n` +
-        'item1.X-ABLabel:Celular\n' +
-        'END:VCARD';
+      result += 'END:VCARD';
 
       return result;
     };
 
     if (message.contacts.length === 1) {
       content.contactMessage = {
-        displayName: message.contacts[0].name.formatted_name,
+        displayName: message.contacts[0].name?.formatted_name ?? '',
         vcard: vcard(message.contacts[0]),
       };
     } else {
       content.contactsArrayMessage = {
-        displayName: `${message.length} contacts`,
-        contacts: message.map((contact) => {
+        displayName: `${message.contacts.length} contacts`,
+        contacts: message.contacts.map((contact) => {
           return {
-            displayName: contact.name.formatted_name,
+            displayName: contact.name?.formatted_name ?? '',
             vcard: vcard(contact),
           };
         }),
@@ -387,7 +388,7 @@ export class BusinessStartupService extends ChannelStartupService {
       let messageRaw: any;
       let pushName: any;
 
-      if (received.contacts) pushName = received.contacts[0].profile.name;
+      pushName = received.contacts?.[0]?.profile?.name;
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
