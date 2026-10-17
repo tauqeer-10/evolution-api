@@ -131,9 +131,10 @@ export class BusinessStartupService extends ChannelStartupService {
     try {
       this.loadChatwoot();
 
-      this.eventHandler(content);
+      const senderJid = createJid(content.messages ? content.messages[0].from : content.statuses[0]?.recipient_id);
+      this.phoneNumber = senderJid;
 
-      this.phoneNumber = createJid(content.messages ? content.messages[0].from : content.statuses[0]?.recipient_id);
+      await this.eventHandler(content, senderJid);
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -299,8 +300,8 @@ export class BusinessStartupService extends ChannelStartupService {
       let result =
         'BEGIN:VCARD\n' +
         'VERSION:3.0\n' +
-        `N:${contact.name?.formatted_name ?? ''}\n` +
-        `FN:${contact.name?.formatted_name ?? ''}\n`;
+        `N:${contact.name.formatted_name}\n` +
+        `FN:${contact.name.formatted_name}\n`;
 
       if (contact.org) {
         result += `ORG:${contact.org.company};\n`;
@@ -314,30 +315,29 @@ export class BusinessStartupService extends ChannelStartupService {
         result += `URL:${contact.urls[0].url}\n`;
       }
 
-      const phone = contact.phones?.[0];
-      if (phone) {
-        if (!phone.wa_id) {
-          phone.wa_id = createJid(phone.phone);
-        }
-        result += `item1.TEL;waid=${phone.wa_id}:${phone.phone}\n` + 'item1.X-ABLabel:Celular\n';
+      if (!contact.phones[0]?.wa_id) {
+        contact.phones[0].wa_id = createJid(contact.phones[0].phone);
       }
 
-      result += 'END:VCARD';
+      result +=
+        `item1.TEL;waid=${contact.phones[0]?.wa_id}:${contact.phones[0].phone}\n` +
+        'item1.X-ABLabel:Celular\n' +
+        'END:VCARD';
 
       return result;
     };
 
     if (message.contacts.length === 1) {
       content.contactMessage = {
-        displayName: message.contacts[0].name?.formatted_name ?? '',
+        displayName: message.contacts[0].name.formatted_name,
         vcard: vcard(message.contacts[0]),
       };
     } else {
       content.contactsArrayMessage = {
-        displayName: `${message.contacts.length} contacts`,
-        contacts: message.contacts.map((contact) => {
+        displayName: `${message.length} contacts`,
+        contacts: message.map((contact) => {
           return {
-            displayName: contact.name?.formatted_name ?? '',
+            displayName: contact.name.formatted_name,
             vcard: vcard(contact),
           };
         }),
@@ -383,19 +383,19 @@ export class BusinessStartupService extends ChannelStartupService {
     return messageType;
   }
 
-  protected async messageHandle(received: any, database: Database, settings: any) {
+  protected async messageHandle(received: any, database: Database, settings: any, senderJid: string) {
     try {
       let messageRaw: any;
       let pushName: any;
 
-      pushName = received.contacts?.[0]?.profile?.name;
+      if (received.contacts) pushName = received.contacts[0].profile.name;
 
       if (received.messages) {
-        const message = received.messages[0]; // Añadir esta línea para definir message
+        const message = received.messages[0];
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
+          remoteJid: senderJid,
           fromMe: message.from === received.metadata.phone_number_id,
         };
 
@@ -669,6 +669,21 @@ export class BusinessStartupService extends ChannelStartupService {
 
         sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
 
+        // Normalized order: Chatwoot first, then bot (consistent with Baileys channel)
+        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+          const chatwootSentMessage = await this.chatwootService.eventWhatsapp(
+            Events.MESSAGES_UPSERT,
+            { instanceName: this.instance.name, instanceId: this.instanceId },
+            messageRaw,
+          );
+
+          if (chatwootSentMessage) {
+            messageRaw.chatwootMessageId = chatwootSentMessage.id;
+            messageRaw.chatwootInboxId = chatwootSentMessage.inbox_id;
+            messageRaw.chatwootConversationId = chatwootSentMessage.conversation_id;
+          }
+        }
+
         this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
         await chatbotController.emit({
@@ -677,20 +692,6 @@ export class BusinessStartupService extends ChannelStartupService {
           msg: messageRaw,
           pushName: messageRaw.pushName,
         });
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          const chatwootSentMessage = await this.chatwootService.eventWhatsapp(
-            Events.MESSAGES_UPSERT,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            messageRaw,
-          );
-
-          if (chatwootSentMessage?.id) {
-            messageRaw.chatwootMessageId = chatwootSentMessage.id;
-            messageRaw.chatwootInboxId = chatwootSentMessage.id;
-            messageRaw.chatwootConversationId = chatwootSentMessage.id;
-          }
-        }
 
         if (!this.isMediaMessage(message) && message.type !== 'sticker') {
           await this.prismaRepository.message.create({
@@ -748,8 +749,8 @@ export class BusinessStartupService extends ChannelStartupService {
         for await (const item of received.statuses) {
           const key = {
             id: item.id,
-            remoteJid: this.phoneNumber,
-            fromMe: this.phoneNumber === received.metadata.phone_number_id,
+            remoteJid: senderJid,
+            fromMe: senderJid === received.metadata.phone_number_id,
           };
           if (settings?.groups_ignore && key.remoteJid.includes('@g.us')) {
             return;
@@ -894,21 +895,18 @@ export class BusinessStartupService extends ChannelStartupService {
     return message;
   }
 
-  protected async eventHandler(content: any) {
+  protected async eventHandler(content: any, senderJid: string) {
     try {
-      // Registro para depuración
       this.logger.log('Contenido recibido en eventHandler:');
       this.logger.log(JSON.stringify(content, null, 2));
 
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
 
-      // Si hay mensajes, verificar primero el tipo
       if (content.messages && content.messages.length > 0) {
         const message = content.messages[0];
         this.logger.log(`Tipo de mensaje recibido: ${message.type}`);
 
-        // Verificamos el tipo de mensaje antes de procesarlo
         if (
           message.type === 'text' ||
           message.type === 'image' ||
@@ -922,14 +920,12 @@ export class BusinessStartupService extends ChannelStartupService {
           message.type === 'button' ||
           message.type === 'reaction'
         ) {
-          // Procesar el mensaje normalmente
-          this.messageHandle(content, database, settings);
+          await this.messageHandle(content, database, settings, senderJid);
         } else {
           this.logger.warn(`Tipo de mensaje no reconocido: ${message.type}`);
         }
       } else if (content.statuses) {
-        // Procesar actualizaciones de estado
-        this.messageHandle(content, database, settings);
+        await this.messageHandle(content, database, settings, senderJid);
       } else {
         this.logger.warn('No se encontraron mensajes ni estados en el contenido recibido');
       }
