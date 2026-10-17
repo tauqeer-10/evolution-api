@@ -112,6 +112,7 @@ import makeWASocket, {
   generateMessageIDV2,
   generateWAMessageFromContent,
   getAggregateVotesInPollMessage,
+  getBinaryNodeChild,
   GetCatalogOptions,
   getContentType,
   getDevice,
@@ -140,7 +141,7 @@ import { Label } from 'baileys/lib/Types/Label';
 import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
 import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
@@ -395,6 +396,14 @@ export class BaileysStartupService extends ChannelStartupService {
     });
 
     if (qr) {
+      // Baileys captures the adv secret once per pairing flow; always advertise the current one,
+      // since companion_reg_refresh can rotate it mid-flow (see companionRegRefresh)
+      const qrParts = qr.split(',');
+      if (qrParts.length === 4 && this.instance.authState?.state?.creds?.advSecretKey) {
+        qrParts[3] = this.instance.authState.state.creds.advSecretKey;
+        qr = qrParts.join(',');
+      }
+
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
           message: 'QR code limit reached, please login again',
@@ -813,9 +822,40 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
 
+    this.client.ws.on('CB:notification,type:companion_reg_refresh', (node: BinaryNode) => {
+      this.companionRegRefresh(node).catch((error) => this.logger.error(['companion_reg_refresh failed', error]));
+    });
+
     this.phoneNumber = number;
 
     return this.client;
+  }
+
+  // WhatsApp retires the adv secret of an unpaired companion with this notification. Baileys only acks it,
+  // so the QR keeps advertising the retired secret and the phone shows "Can't link new device".
+  // Mirrors WA Web: rotate the secret, persist it and re-render the QR currently on screen.
+  private async companionRegRefresh(node: BinaryNode) {
+    if (!getBinaryNodeChild(node, 'companion_reg_refresh') && !getBinaryNodeChild(node, 'pair-device-rotate-qr')) {
+      return;
+    }
+
+    const creds = this.instance.authState.state.creds;
+
+    // Already registered (paired, or pairing code requested): the secret is what pairing is verified against
+    if (creds.me) {
+      return;
+    }
+
+    creds.advSecretKey = randomBytes(32).toString('base64');
+    await this.instance.authState.saveCreds();
+
+    this.logger.info('companion_reg_refresh: rotated adv secret, re-rendering QR code');
+
+    if (this.instance.qrcode?.code) {
+      // A re-render of the QR already on screen, not a new one: don't count it towards QRCODE.LIMIT
+      this.instance.qrcode.count--;
+      await this.connectionUpdate({ qr: this.instance.qrcode.code });
+    }
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
@@ -2041,7 +2081,9 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      const labelName = label.name.replace(/[^\x20-\x7E]/g, '');
+      // Partial label updates can arrive without a name; fall back to the saved one
+      const labelName = (label.name ?? savedLabel?.name)?.replace(/[^\x20-\x7E]/g, '');
+      if (labelName === undefined) return;
       if (!savedLabel || savedLabel.color !== `${label.color}` || savedLabel.name !== labelName) {
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.LABELS) {
           const labelData = {
